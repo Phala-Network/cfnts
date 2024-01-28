@@ -7,4 +7,4 @@ mod dns_resolver;
 mod ntp;
 mod nts_ke;
 
-pub use client::nts_get;
+pub use client::get_time;

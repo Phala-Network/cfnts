@@ -11,7 +11,7 @@ use log::debug;
 use crate::ntp::client::{run_nts_ntp_client, NtpResult};
 use crate::nts_ke::client::{run_nts_ke_client, ClientConfig};
 
-pub async fn nts_get(host: &str, port: Option<u16>, use_ipv6: bool) -> Result<NtpResult> {
+pub async fn get_time(host: &str, port: Option<u16>, use_ipv6: bool) -> Result<NtpResult> {
     let config = ClientConfig {
         host: host.into(),
         port,
@@ -28,6 +28,6 @@ pub async fn nts_get(host: &str, port: Option<u16>, use_ipv6: bool) -> Result<Nt
 
 #[tokio::test]
 async fn it_works() {
-    let result = nts_get("time.cloudflare.com", None, false).await.unwrap();
+    let result = get_time("time.cloudflare.com", None, false).await.unwrap();
     assert!(result.time_diff < 10.);
 }
