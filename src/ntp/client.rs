@@ -33,6 +33,28 @@ pub struct NtpResult {
     pub transmit_timestamp: f64,
 }
 
+impl NtpResult {
+    pub fn get_receive_time(&self) -> SystemTime {
+        ntpfloat_to_system(self.receive_timestamp)
+    }
+
+    pub fn get_transmit_time(&self) -> SystemTime {
+        ntpfloat_to_system(self.transmit_timestamp)
+    }
+
+    pub fn receive_time_duration(&self) -> Duration {
+        self.get_receive_time()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+    }
+
+    pub fn transmit_time_duration(&self) -> Duration {
+        self.get_transmit_time()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum NtpClientError {
     NoIpv4AddrFound,
@@ -71,6 +93,14 @@ fn system_to_ntpfloat(time: SystemTime) -> f64 {
     let unix_offset = Duration::new(UNIX_OFFSET, 0);
     let epoch_time = unix_offset + unix_time;
     epoch_time.as_secs() as f64 + (epoch_time.subsec_nanos() as f64) / 1.0e9
+}
+
+fn ntpfloat_to_system(time: f64) -> SystemTime {
+    let secs = time as u64;
+    let nanos = ((time - secs as f64) * 1.0e9) as u32;
+    let unix_offset = Duration::new(UNIX_OFFSET, 0);
+    let epoch_time = Duration::new(secs, nanos) - unix_offset;
+    SystemTime::UNIX_EPOCH + epoch_time
 }
 
 /// Returns a float representing the ntp timestamp

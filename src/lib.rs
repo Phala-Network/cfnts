@@ -8,3 +8,4 @@ mod ntp;
 mod nts_ke;
 
 pub use client::get_time;
+pub use ntp::client::NtpResult;
