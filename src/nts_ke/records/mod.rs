@@ -9,8 +9,6 @@ mod end_of_message;
 mod error;
 mod new_cookie;
 mod next_protocol;
-mod port;
-mod server;
 mod warning;
 
 // We pub use everything in the submodules. You can limit the scope of usage by putting it the
@@ -20,14 +18,16 @@ pub use self::end_of_message::*;
 pub use self::error::*;
 pub use self::new_cookie::*;
 pub use self::next_protocol::*;
-pub use self::port::*;
-pub use self::server::*;
 pub use self::warning::*;
 
-use rustls::TLSError;
+use rustls::Error as TLSError;
 use std::fmt;
 
-use crate::cookie::NTSKeys;
+#[derive(Debug, Copy, Clone)]
+pub struct NTSKeys {
+    pub c2s: [u8; 32],
+    pub s2c: [u8; 32],
+}
 
 pub const HEADER_SIZE: usize = 4;
 
@@ -38,14 +38,11 @@ pub enum KeRecord {
     Warning(WarningRecord),
     AeadAlgorithm(AeadAlgorithmRecord),
     NewCookie(NewCookieRecord),
-    Server(ServerRecord),
-    Port(PortRecord),
 }
 
 #[derive(Clone, Copy)]
 pub enum Party {
     Client,
-    Server,
 }
 
 pub trait KeRecordTrait: Sized {
@@ -138,9 +135,7 @@ pub fn deserialize(sender: Party, bytes: &[u8]) -> Result<KeRecord, DeserializeE
         (Error, ErrorRecord),
         (Warning, WarningRecord),
         (AeadAlgorithm, AeadAlgorithmRecord),
-        (NewCookie, NewCookieRecord),
-        (Server, ServerRecord),
-        (Port, PortRecord)
+        (NewCookie, NewCookieRecord)
     );
 
     Ok(record)
@@ -148,7 +143,7 @@ pub fn deserialize(sender: Party, bytes: &[u8]) -> Result<KeRecord, DeserializeE
 
 /// gen_key computes the client and server keys using exporters.
 /// https://tools.ietf.org/html/draft-ietf-ntp-using-nts-for-ntp-28#section-4.3
-pub fn gen_key<T: rustls::Session>(session: &T) -> Result<NTSKeys, TLSError> {
+pub fn gen_key<T>(session: &rustls::ConnectionCommon<T>) -> Result<NTSKeys, TLSError> {
     let mut keys: NTSKeys = NTSKeys {
         c2s: [0; 32],
         s2c: [0; 32],
@@ -216,9 +211,9 @@ impl fmt::Display for NtsKeParseError {
 pub fn process_record(
     record: KeRecord,
     state: &mut ReceivedNtsKeRecordState,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), NtsKeParseError> {
     if state.finished {
-        return Err(Box::new(NtsKeParseError::RecordAfterEnd));
+        return Err(NtsKeParseError::RecordAfterEnd);
     }
 
     match record {
@@ -230,7 +225,7 @@ pub fn process_record(
                 .map(|protocol| protocol.as_protocol_id())
                 .collect();
         }
-        KeRecord::Error(_) => return Err(Box::new(NtsKeParseError::ErrorRecord)),
+        KeRecord::Error(_) => return Err(NtsKeParseError::ErrorRecord),
         KeRecord::Warning(_) => return Ok(()),
         KeRecord::AeadAlgorithm(record) => {
             state.aead_scheme = record
@@ -240,8 +235,6 @@ pub fn process_record(
                 .collect();
         }
         KeRecord::NewCookie(record) => state.cookies.push(record.into_bytes()),
-        KeRecord::Server(record) => state.next_server = Some(record.into_string()),
-        KeRecord::Port(record) => state.next_port = Some(record.port()),
     }
 
     Ok(())

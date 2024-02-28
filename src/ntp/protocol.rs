@@ -1,5 +1,5 @@
+use aes_siv::aead::{consts::U16, AeadInPlace};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use miscreant::aead::Aead;
 use rand::Rng;
 
 use std::io::{Cursor, Error, ErrorKind, Read, Write};
@@ -10,9 +10,7 @@ use self::NtpExtensionType::*;
 use self::PacketMode::*;
 
 /// These numbers are from RFC 5905
-pub const VERSION: u8 = 4;
 pub const UNIX_OFFSET: u64 = 2_208_988_800;
-pub const PHI: f64 = 15e-6;
 /// TWO_POW_32 is a floating point power of two (2**32)
 pub const TWO_POW_32: f64 = 4294967296.0;
 
@@ -218,13 +216,6 @@ pub fn serialize_header(head: NtpPacketHeader) -> Vec<u8> {
     buff.into_inner()
 }
 
-/// parse_ntp_packet parses an NTP packet
-pub fn parse_ntp_packet(buff: &[u8]) -> Result<NtpPacket, std::io::Error> {
-    let header = parse_packet_header(buff)?;
-    let exts = parse_extensions(&buff[48..])?;
-    Ok(NtpPacket { header, exts })
-}
-
 /// Properly parsing NTP extensions in accordance with RFC 7822 is not necessary
 /// since the legacy MAC will never be used by this code.
 fn parse_extensions(buff: &[u8]) -> Result<Vec<NtpExtension>, std::io::Error> {
@@ -252,16 +243,6 @@ fn parse_extensions(buff: &[u8]) -> Result<Vec<NtpExtension>, std::io::Error> {
     Ok(retval)
 }
 
-/// serialize_ntp_packet returns the packet in wire format.
-pub fn serialize_ntp_packet(pack: NtpPacket) -> Vec<u8> {
-    let mut buff = Cursor::new(Vec::new());
-    buff.write_all(&serialize_header(pack.header))
-        .expect("buffer write failed; can't serialize NtpPacket");
-    buff.write_all(&serialize_extensions(pack.exts))
-        .expect("buffer write failed; can't serialize NtpPacket");
-    buff.into_inner()
-}
-
 fn serialize_extensions(exts: Vec<NtpExtension>) -> Vec<u8> {
     let mut buff = Cursor::new(Vec::new());
     for ext in exts {
@@ -278,32 +259,8 @@ fn serialize_extensions(exts: Vec<NtpExtension>) -> Vec<u8> {
     buff.into_inner()
 }
 
-/// has_extension returns true if the packet has an extension of the right kind
-pub fn has_extension(pack: &NtpPacket, kind: NtpExtensionType) -> bool {
-    pack.exts
-        .clone()
-        .into_iter()
-        .any(|ext| ext.ext_type == kind)
-}
-
-/// is_nts_packet returns true if this packet is plausibly an NTS packet.
-/// TODO: enforce rules tighter about uniqueness of some of these extensions.
-pub fn is_nts_packet(pack: &NtpPacket) -> bool {
-    has_extension(pack, NTSCookie)
-        && has_extension(pack, NTSAuthenticator)
-        && has_extension(pack, UniqueIdentifier)
-}
-
-/// extract_extension retrieves the extension if it exists, and else none.
-pub fn extract_extension(pack: &NtpPacket, kind: NtpExtensionType) -> Option<NtpExtension> {
-    pack.exts
-        .clone()
-        .into_iter()
-        .find(|ext| ext.ext_type == kind)
-}
-
 /// parse_nts_packet parses an NTS packet.
-pub fn parse_nts_packet<T: Aead>(
+pub fn parse_nts_packet<T: AeadInPlace>(
     buff: &[u8],
     decryptor: &mut T,
 ) -> Result<NtsPacket, std::io::Error> {
@@ -344,7 +301,7 @@ pub fn parse_nts_packet<T: Aead>(
     ))
 }
 
-fn parse_decrypt_auth_ext<T: Aead>(
+fn parse_decrypt_auth_ext<T: AeadInPlace>(
     auth_dat: &[u8],
     auth_ext_contents: &[u8],
     decryptor: &mut T,
@@ -365,24 +322,35 @@ fn parse_decrypt_auth_ext<T: Aead>(
     }
     let nonce = &auth_ext_contents[4..(4 + nonce_len)];
     let ciphertext = &auth_ext_contents[(4 + nonce_pad_len)..(4 + nonce_pad_len + cipher_len)];
-    let res = decryptor.open(nonce, auth_dat, ciphertext);
+    let mut buffer = Vec::from(ciphertext);
+    let res = decryptor.decrypt_in_place(nonce.into(), auth_dat, &mut buffer);
     if res.is_err() {
         return Err(Error::new(ErrorKind::InvalidInput, "authentication failed"));
     }
-    Ok(res.unwrap())
+    Ok(buffer)
 }
 
 /// serialize_nts_packet serializes the packet and does all the encryption
-pub fn serialize_nts_packet<T: Aead>(packet: NtsPacket, encryptor: &mut T) -> Vec<u8> {
+pub fn serialize_nts_packet<T: AeadInPlace<NonceSize = U16>>(
+    packet: NtsPacket,
+    encryptor: &mut T,
+) -> Vec<u8> {
+    use aes_siv::aead::generic_array::typenum::Unsigned;
+
     let mut buff = Cursor::new(Vec::new());
     buff.write_all(&serialize_header(packet.header))
         .expect("Nts header could not be written, failed to serialize NtsPacket");
     buff.write_all(&serialize_extensions(packet.auth_exts))
         .expect("Nts extensions could not be written, failed to serialize NtsPacket");
     let plaintext = serialize_extensions(packet.auth_enc_exts);
-    let mut nonce = [0; NONCE_LEN];
+    let mut nonce = [0u8; U16::USIZE];
     rand::thread_rng().fill(&mut nonce);
-    let ciphertext = encryptor.seal(&nonce, buff.get_ref(), &plaintext);
+    let mut buffer = plaintext;
+    encryptor
+        .encrypt_in_place((&nonce).into(), buff.get_ref(), &mut buffer)
+        .expect("Encryption failed, failed to serialize NtsPacket");
+
+    let ciphertext = buffer;
 
     let mut authent_buffer = Cursor::new(Vec::new());
     authent_buffer
@@ -417,10 +385,10 @@ pub fn serialize_nts_packet<T: Aead>(packet: NtsPacket, encryptor: &mut T) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use miscreant::aead::Aes128SivAead;
+    use aes_siv::{Aes128SivAead, KeyInit as _};
     #[test]
     fn test_ntp_header_parse() {
-        let leaps = vec![NoLeap, Positive, Negative, Unknown];
+        let leaps = vec![NoLeap, Positive, Negative, LeapState::Unknown];
         let versions = vec![1, 2, 3, 4, 5, 6, 7];
         let modes = vec![SymmetricActive, SymmetricPassive, Client, Server, Broadcast];
         for leap in &leaps {
@@ -466,7 +434,7 @@ mod tests {
         check_ext_array_eq(pkt1.auth_enc_exts, pkt2.auth_enc_exts);
         check_ext_array_eq(pkt1.auth_exts, pkt2.auth_exts);
     }
-    fn roundtrip_test<T: Aead>(input: NtsPacket, enc: &mut T) {
+    fn roundtrip_test<T: AeadInPlace<NonceSize = U16>>(input: NtsPacket, enc: &mut T) {
         let mut packet = serialize_nts_packet::<T>(input.clone(), enc);
         let decrypt = parse_nts_packet(&packet, enc).unwrap();
         check_nts_match(input, decrypt);
@@ -481,7 +449,7 @@ mod tests {
     #[test]
     fn test_nts_parse() {
         let key = [0; 32];
-        let mut test_aead = Aes128SivAead::new(&key);
+        let mut test_aead = Aes128SivAead::new((&key).into());
         let header = NtpPacketHeader {
             leap_indicator: NoLeap,
             version: 4,

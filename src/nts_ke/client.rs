@@ -1,17 +1,17 @@
-use slog::{debug, info};
-use std::error::Error;
-use std::io::{Read, Write};
-use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use anyhow::{bail, Result};
+
+use log::debug;
+use std::convert::TryFrom;
 use std::sync::Arc;
-use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use tokio::net::TcpStream;
 
 use rustls;
-use webpki;
 use webpki_roots;
 
 use super::records;
 
-use crate::cookie::NTSKeys;
 use crate::nts_ke::records::{
     deserialize,
     process_record,
@@ -28,6 +28,7 @@ use crate::nts_ke::records::{
     // Enums.
     KnownAeadAlgorithm,
     KnownNextProtocol,
+    NTSKeys,
     NextProtocolRecord,
     NtsKeParseError,
     Party,
@@ -38,14 +39,19 @@ use crate::nts_ke::records::{
     // Constants.
     HEADER_SIZE,
 };
-use crate::sub_command::client::ClientConfig;
 
 type Cookie = Vec<u8>;
 
 const DEFAULT_NTP_PORT: u16 = 123;
 const DEFAULT_KE_PORT: u16 = 4460;
 const DEFAULT_SCHEME: u16 = 0;
-const TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Debug)]
+pub struct ClientConfig {
+    pub host: String,
+    pub port: Option<u16>,
+    pub use_ipv6: bool,
+}
 
 #[derive(Clone, Debug)]
 pub struct NtsKeResult {
@@ -55,66 +61,44 @@ pub struct NtsKeResult {
     pub next_server: String,
     pub next_port: u16,
     pub keys: NTSKeys,
-    pub use_ipv4: Option<bool>,
+    pub use_ipv6: bool,
 }
 
 /// run_nts_client executes the nts client with the config in config file
-pub fn run_nts_ke_client(
-    logger: &slog::Logger,
-    client_config: ClientConfig,
-) -> Result<NtsKeResult, Box<dyn Error>> {
-    let mut tls_config = rustls::ClientConfig::new();
+pub async fn run_nts_ke_client(client_config: ClientConfig) -> Result<NtsKeResult> {
     let alpn_proto = String::from("ntske/1");
     let alpn_bytes = alpn_proto.into_bytes();
-    tls_config.set_protocols(&[alpn_bytes]);
-
-    match client_config.trusted_cert {
-        Some(cert) => {
-            info!(logger, "loading custom trust root");
-            tls_config.root_store.add(&cert)?;
-        }
-        None => {
-            tls_config
-                .root_store
-                .add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
-        }
-    }
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![alpn_bytes];
 
     let rc_config = Arc::new(tls_config);
-    let hostname = webpki::DNSNameRef::try_from_ascii_str(client_config.host.as_str())
-        .expect("server hostname is invalid");
-    let mut client = rustls::ClientSession::new(&rc_config, hostname);
-    debug!(logger, "Connecting");
-    let mut port = DEFAULT_KE_PORT;
-    if let Some(p) = client_config.port {
-        port = p.parse::<u16>()?;
-    }
+    debug!("Connecting");
+    let port = client_config.port.unwrap_or(DEFAULT_KE_PORT);
 
-    let mut ip_addrs = (client_config.host.as_str(), port).to_socket_addrs()?;
-    let addr;
-    if let Some(use_ipv4) = client_config.use_ipv4 {
-        if use_ipv4 {
-            // mandated to use ipv4
-            addr = ip_addrs.find(|&x| x.is_ipv4());
-            if addr.is_none() {
-                return Err(Box::new(NtsKeParseError::NoIpv4AddrFound));
-            }
-        } else {
-            // mandated to use ipv6
-            addr = ip_addrs.find(|&x| x.is_ipv6());
-            if addr.is_none() {
-                return Err(Box::new(NtsKeParseError::NoIpv6AddrFound));
-            }
+    let ip_addrs = crate::dns_resolver::resolve_addrs(client_config.host.as_str()).await?;
+    let addr = if client_config.use_ipv6 {
+        // mandated to use ipv6
+        match ip_addrs.iter().find(|&x| x.is_ipv6()) {
+            Some(addr) => addr,
+            None => return Err(NtsKeParseError::NoIpv6AddrFound.into()),
         }
     } else {
-        // sniff whichever one is supported
-        addr = ip_addrs.next();
-    }
-    let mut stream = TcpStream::connect_timeout(&addr.unwrap(), TIMEOUT)?;
-    stream.set_read_timeout(Some(TIMEOUT))?;
-    stream.set_write_timeout(Some(TIMEOUT))?;
-
-    let mut tls_stream = rustls::Stream::new(&mut client, &mut stream);
+        // mandated to use ipv4
+        match ip_addrs.iter().find(|&x| x.is_ipv4()) {
+            Some(addr) => addr,
+            None => return Err(NtsKeParseError::NoIpv4AddrFound.into()),
+        }
+    };
+    let stream = TcpStream::connect((*addr, port)).await?;
+    let tls_connector = tokio_rustls::TlsConnector::from(rc_config);
+    let hostname = rustls::pki_types::ServerName::try_from(client_config.host.as_str())
+        .expect("server hostname is invalid")
+        .to_owned();
+    let mut tls_stream = tls_connector.connect(hostname, stream).await?;
 
     let next_protocol_record = NextProtocolRecord::from(vec![KnownNextProtocol::Ntpv4]);
     let aead_record = AeadAlgorithmRecord::from(vec![KnownAeadAlgorithm::AeadAesSivCmac256]);
@@ -123,10 +107,12 @@ pub fn run_nts_ke_client(
     let clientrec = &mut serialize(next_protocol_record);
     clientrec.append(&mut serialize(aead_record));
     clientrec.append(&mut serialize(end_record));
-    tls_stream.write_all(clientrec)?;
-    tls_stream.flush()?;
-    debug!(logger, "Request transmitted");
-    let keys = records::gen_key(tls_stream.sess).unwrap();
+
+    tls_stream.write_all(clientrec).await?;
+    tls_stream.flush().await?;
+
+    debug!("Request transmitted");
+    let keys = records::gen_key(tls_stream.get_ref().1).unwrap();
 
     let mut state = ReceivedNtsKeRecordState {
         finished: false,
@@ -142,18 +128,13 @@ pub fn run_nts_ke_client(
 
         // We should use `read_exact` here because we always need to read 4 bytes to get the
         // header.
-        if let Err(error) = tls_stream.read_exact(&mut header[..]) {
-            return Err(Box::new(error));
-        }
+        tls_stream.read_exact(&mut header[..]).await?;
 
         // Retrieve a body length from the 3rd and 4th bytes of the header.
         let body_length = u16::from_be_bytes([header[2], header[3]]);
         let mut body = vec![0; body_length as usize];
 
-        // `read_exact` the length of the body.
-        if let Err(error) = tls_stream.read_exact(body.as_mut_slice()) {
-            return Err(Box::new(error));
-        }
+        tls_stream.read_exact(body.as_mut_slice()).await?;
 
         // Reconstruct the whole record byte array to let the `records` module deserialize it.
         let mut record_bytes = Vec::from(&header[..]);
@@ -164,38 +145,24 @@ pub fn run_nts_ke_client(
         // length field.
         match deserialize(Party::Client, record_bytes.as_slice()) {
             Ok(record) => {
-                let status = process_record(record, &mut state);
-                match status {
-                    Ok(_) => {}
-                    Err(err) => {
-                        return Err(err);
-                    }
-                }
+                process_record(record, &mut state)?;
             }
             Err(DeserializeError::UnknownNotCriticalRecord) => {
                 // If it's not critical, just ignore the error.
-                debug!(logger, "unknown record type");
+                debug!("unknown record type");
             }
             Err(DeserializeError::UnknownCriticalRecord) => {
-                // TODO: This should propertly handled by sending an Error record.
-                debug!(logger, "error: unknown critical record");
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "unknown critical record",
-                )));
+                debug!("error: unknown critical record");
+                bail!("unknown critical record");
             }
             Err(DeserializeError::Parsing(error)) => {
-                // TODO: This shouldn't be wrapped as a trait object.
-                debug!(logger, "error: {}", error);
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    error,
-                )));
+                debug!("error: {}", error);
+                bail!("parse error: {}", error);
             }
         }
     }
-    debug!(logger, "saw the end of the response");
-    stream.shutdown(Shutdown::Write)?;
+    debug!("saw the end of the response");
+    tls_stream.shutdown().await?;
 
     let aead_scheme = if state.aead_scheme.is_empty() {
         DEFAULT_SCHEME
@@ -210,6 +177,6 @@ pub fn run_nts_ke_client(
         next_server: state.next_server.unwrap_or(client_config.host.clone()),
         next_port: state.next_port.unwrap_or(DEFAULT_NTP_PORT),
         keys,
-        use_ipv4: client_config.use_ipv4,
+        use_ipv6: client_config.use_ipv6,
     })
 }

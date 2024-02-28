@@ -1,14 +1,14 @@
 use crate::nts_ke::client::NtsKeResult;
 
-use miscreant::aead::Aead;
-use miscreant::aead::Aes128SivAead;
+use aes_siv::{Aes128SivAead, KeyInit};
+use log::debug;
 use rand::Rng;
-use slog::debug;
-use std::error::Error;
 use std::fmt;
 
-use std::net::{ToSocketAddrs, UdpSocket};
 use std::time::{Duration, SystemTime};
+use tokio::net::UdpSocket;
+
+use anyhow::Result;
 
 use super::protocol::parse_nts_packet;
 use super::protocol::serialize_nts_packet;
@@ -24,11 +24,35 @@ use super::protocol::UNIX_OFFSET;
 use self::NtpClientError::*;
 
 const BUFF_SIZE: usize = 2048;
-const TIMEOUT: Duration = Duration::from_secs(10);
 
+#[derive(Debug)]
 pub struct NtpResult {
     pub stratum: u8,
     pub time_diff: f64,
+    pub receive_timestamp: f64,
+    pub transmit_timestamp: f64,
+}
+
+impl NtpResult {
+    pub fn get_receive_time(&self) -> SystemTime {
+        ntpfloat_to_system(self.receive_timestamp)
+    }
+
+    pub fn get_transmit_time(&self) -> SystemTime {
+        ntpfloat_to_system(self.transmit_timestamp)
+    }
+
+    pub fn receive_time_duration(&self) -> Duration {
+        self.get_receive_time()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+    }
+
+    pub fn transmit_time_duration(&self) -> Duration {
+        self.get_transmit_time()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +95,14 @@ fn system_to_ntpfloat(time: SystemTime) -> f64 {
     epoch_time.as_secs() as f64 + (epoch_time.subsec_nanos() as f64) / 1.0e9
 }
 
+fn ntpfloat_to_system(time: f64) -> SystemTime {
+    let secs = time as u64;
+    let nanos = ((time - secs as f64) * 1.0e9) as u32;
+    let unix_offset = Duration::new(UNIX_OFFSET, 0);
+    let epoch_time = Duration::new(secs, nanos) - unix_offset;
+    SystemTime::UNIX_EPOCH + epoch_time
+}
+
 /// Returns a float representing the ntp timestamp
 fn timestamp_to_float(time: u64) -> f64 {
     let ts_secs = time >> 32;
@@ -79,45 +111,28 @@ fn timestamp_to_float(time: u64) -> f64 {
 }
 
 /// Run the NTS client with the given data from key exchange
-pub fn run_nts_ntp_client(
-    logger: &slog::Logger,
-    state: NtsKeResult,
-) -> Result<NtpResult, Box<dyn Error>> {
-    let mut ip_addrs = (state.next_server.as_str(), state.next_port).to_socket_addrs()?;
+pub async fn run_nts_ntp_client(state: NtsKeResult) -> Result<NtpResult> {
+    let ip_addrs = crate::dns_resolver::resolve_addrs(state.next_server.as_str()).await?;
     let addr;
     let socket;
-    if let Some(use_ipv4) = state.use_ipv4 {
-        if use_ipv4 {
-            // mandated to use ipv4
-            addr = ip_addrs.find(|&x| x.is_ipv4());
-            if addr.is_none() {
-                return Err(Box::new(NoIpv4AddrFound));
-            }
-            socket = UdpSocket::bind("0.0.0.0:0");
-        } else {
-            // mandated to use ipv6
-            addr = ip_addrs.find(|&x| x.is_ipv6());
-            if addr.is_none() {
-                return Err(Box::new(NoIpv6AddrFound));
-            }
-            socket = UdpSocket::bind("[::]:0");
-        }
+    if state.use_ipv6 {
+        // mandated to use ipv6
+        addr = match ip_addrs.iter().find(|&x| x.is_ipv6()) {
+            Some(addr) => addr,
+            None => return Err(NoIpv6AddrFound.into()),
+        };
+        socket = UdpSocket::bind("[::]:0").await?;
     } else {
-        // sniff whichever one is supported
-        addr = ip_addrs.next();
-        // check if this address is ipv4 or ipv6
-        if addr.unwrap().is_ipv6() {
-            socket = UdpSocket::bind("[::]:0");
-        } else {
-            socket = UdpSocket::bind("0.0.0.0:0");
-        }
-    }
+        // mandated to use ipv4
+        addr = match ip_addrs.iter().find(|&x| x.is_ipv4()) {
+            Some(addr) => addr,
+            None => return Err(NoIpv4AddrFound.into()),
+        };
+        socket = UdpSocket::bind("0.0.0.0:0").await?;
+    };
 
-    let socket = socket.unwrap();
-    socket.set_read_timeout(Some(TIMEOUT))?;
-    socket.set_write_timeout(Some(TIMEOUT))?;
-    let mut send_aead = Aes128SivAead::new(&state.keys.c2s);
-    let mut recv_aead = Aes128SivAead::new(&state.keys.s2c);
+    let mut send_aead = Aes128SivAead::new((&state.keys.c2s).into());
+    let mut recv_aead = Aes128SivAead::new((&state.keys.s2c).into());
     let header = NtpPacketHeader {
         leap_indicator: LeapState::NoLeap,
         version: 4,
@@ -150,31 +165,28 @@ pub fn run_nts_ntp_client(
         auth_exts,
         auth_enc_exts: vec![],
     };
-    socket.connect(addr.unwrap())?;
+    socket.connect((*addr, state.next_port)).await?;
     let wire_packet = &serialize_nts_packet::<Aes128SivAead>(packet, &mut send_aead);
     let t1 = system_to_ntpfloat(SystemTime::now());
-    socket.send(wire_packet)?;
-    debug!(logger, "transmitting packet");
+    socket.send(wire_packet).await?;
+    debug!("transmitting packet");
     let mut buff = [0; BUFF_SIZE];
-    let (size, _origin) = socket.recv_from(&mut buff)?;
+    let (size, _origin) = socket.recv_from(&mut buff).await?;
     let t4 = system_to_ntpfloat(SystemTime::now());
-    debug!(logger, "received packet");
-    let received = parse_nts_packet::<Aes128SivAead>(&buff[0..size], &mut recv_aead);
-    match received {
-        Err(x) => Err(Box::new(x)),
-        Ok(packet) => {
-            // check if server response contains the same UniqueIdentifier as client request
-            let resp_unique_id = packet.auth_exts[0].clone().contents;
-            if resp_unique_id != unique_id {
-                return Err(Box::new(InvalidUid));
-            }
-
-            Ok(NtpResult {
-                stratum: packet.header.stratum,
-                time_diff: ((timestamp_to_float(packet.header.receive_timestamp) - t1)
-                    + (timestamp_to_float(packet.header.transmit_timestamp) - t4))
-                    / 2.0,
-            })
-        }
+    debug!("received packet");
+    let packet = parse_nts_packet::<Aes128SivAead>(&buff[0..size], &mut recv_aead)?;
+    // check if server response contains the same UniqueIdentifier as client request
+    let resp_unique_id = packet.auth_exts[0].clone().contents;
+    if resp_unique_id != unique_id {
+        return Err(InvalidUid.into());
     }
+
+    let receive_timestamp = timestamp_to_float(packet.header.receive_timestamp);
+    let transmit_timestamp = timestamp_to_float(packet.header.transmit_timestamp);
+    Ok(NtpResult {
+        stratum: packet.header.stratum,
+        time_diff: ((receive_timestamp - t1) + (transmit_timestamp - t4)) / 2.0,
+        receive_timestamp,
+        transmit_timestamp,
+    })
 }

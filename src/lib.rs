@@ -2,8 +2,10 @@
 // Copyright (c) 2019, Cloudflare. All rights reserved.
 // See LICENSE for licensing information.
 
-//! Subcommand collections.
+mod client;
+mod dns_resolver;
+mod ntp;
+mod nts_ke;
 
-pub mod client;
-pub mod ke_server;
-pub mod ntp_server;
+pub use client::get_time;
+pub use ntp::client::NtpResult;
